@@ -52,6 +52,9 @@ class MediaMetadata:
     
     # Playlist-specific fields (None for single videos)
     total_videos: int | None = None
+    
+    # Raw metadata dictionary
+    info_dict: dict[str, Any] = field(default_factory=dict)
 
 
 def validate_and_detect_url(url: str) -> tuple[str, bool]:
@@ -155,7 +158,8 @@ def analyze_url(url: str) -> MediaMetadata:
             title=str(title),
             uploader=str(uploader),
             thumbnail_url=thumbnail_url,
-            total_videos=total_videos
+            total_videos=total_videos,
+            info_dict=info
         )
     else:
         title = info.get("title") or "Unknown Video"
@@ -183,7 +187,8 @@ def analyze_url(url: str) -> MediaMetadata:
             duration=duration,
             upload_date=upload_date,
             view_count=view_count,
-            formats=formats
+            formats=formats,
+            info_dict=info
         )
 
 

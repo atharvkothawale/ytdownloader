@@ -11,8 +11,9 @@ from PIL import Image
 import requests
 from CTkMessagebox import CTkMessagebox
 
-from analyzer import analyze_url, MediaMetadata
+from analyzer import analyze_url, MediaMetadata, AnalysisError
 from downloader import Downloader
+from format_manager import FormatManager, DownloadOption, format_size
 
 logger = logging.getLogger("yt_downloader_pro.main_window")
 
@@ -33,6 +34,11 @@ class MainWindow:
         self.quality_var = ctk.StringVar(value="Best available")
         
         self.downloader = Downloader()
+        
+        # Mapped format options state
+        self.metadata: MediaMetadata | None = None
+        self.video_options: list[DownloadOption] = []
+        self.audio_option: DownloadOption | None = None
 
         self._build_ui()
 
@@ -108,14 +114,38 @@ class MainWindow:
         # Download Type
         type_lbl = ctk.CTkLabel(options_panel, text="Download type", font=("Segoe UI", 11, "bold"), text_color="#e2e8f0", anchor="w")
         type_lbl.grid(row=0, column=0, sticky="w", padx=(16, 12), pady=(16, 6))
-        self.mode_combo = ctk.CTkComboBox(options_panel, variable=self.download_mode_var, values=["Video (MP4)", "Audio (MP3)"], state="readonly", fg_color="#111827", border_color="#374151", button_color="#111827", button_hover_color="#1f2937")
+        self.mode_combo = ctk.CTkComboBox(
+            options_panel, 
+            variable=self.download_mode_var, 
+            values=["Video (MP4)", "Audio (MP3)"], 
+            state="readonly", 
+            fg_color="#111827", 
+            border_color="#374151", 
+            button_color="#111827", 
+            button_hover_color="#1f2937",
+            command=self._on_mode_change
+        )
         self.mode_combo.grid(row=0, column=1, columnspan=2, sticky="ew", padx=(0, 16), pady=(16, 6))
 
         # Quality
-        quality_lbl = ctk.CTkLabel(options_panel, text="Quality", font=("Segoe UI", 11, "bold"), text_color="#e2e8f0", anchor="w")
-        quality_lbl.grid(row=1, column=0, sticky="w", padx=(16, 12), pady=6)
-        self.quality_combo = ctk.CTkComboBox(options_panel, variable=self.quality_var, values=["Best available"], state="readonly", fg_color="#111827", border_color="#374151", button_color="#111827", button_hover_color="#1f2937")
+        self.quality_lbl = ctk.CTkLabel(options_panel, text="Quality", font=("Segoe UI", 11, "bold"), text_color="#e2e8f0", anchor="w")
+        self.quality_lbl.grid(row=1, column=0, sticky="w", padx=(16, 12), pady=6)
+        
+        self.quality_combo = ctk.CTkComboBox(
+            options_panel, 
+            variable=self.quality_var, 
+            values=["Best available"], 
+            state="disabled",  # disabled initially
+            fg_color="#111827", 
+            border_color="#374151", 
+            button_color="#111827", 
+            button_hover_color="#1f2937",
+            command=self._on_quality_change
+        )
         self.quality_combo.grid(row=1, column=1, columnspan=2, sticky="ew", padx=(0, 16), pady=6)
+
+        # Best Audio static label placeholder (hidden initially)
+        self.best_audio_label = ctk.CTkLabel(options_panel, text="Best Audio", font=("Segoe UI", 11, "bold"), text_color="#f8fafc", anchor="w")
 
         # Output Folder
         folder_lbl = ctk.CTkLabel(options_panel, text="Output folder", font=("Segoe UI", 11, "bold"), text_color="#e2e8f0", anchor="w")
@@ -132,7 +162,7 @@ class MainWindow:
         self.analyze_button = ctk.CTkButton(action_row, text="Analyze", font=("Segoe UI", 11, "bold"), fg_color="#1f2937", hover_color="#374151", text_color="#e5e7eb", border_width=1, border_color="#374151", width=120, height=35, command=self._analyze_action)
         self.analyze_button.pack(side="left", padx=(0, 10))
 
-        self.download_button = ctk.CTkButton(action_row, text="Download", font=("Segoe UI", 11, "bold"), fg_color="#2563eb", hover_color="#1d4ed8", text_color="#ffffff", width=120, height=35, command=self._download_action)
+        self.download_button = ctk.CTkButton(action_row, text="Download", font=("Segoe UI", 11, "bold"), fg_color="#2563eb", hover_color="#1d4ed8", text_color="#ffffff", width=120, height=35, state="disabled", command=self._download_action)
         self.download_button.pack(side="left")
 
         # Preview Panel
@@ -157,6 +187,8 @@ class MainWindow:
         # Hidden Thumbnail and Details Frame
         self.preview_image_label = ctk.CTkLabel(self.preview_panel, text="")
         self.details_frame = ctk.CTkFrame(self.preview_panel, fg_color="transparent")
+        self.metadata_subframe = ctk.CTkFrame(self.details_frame, fg_color="transparent")
+        self.format_subframe = ctk.CTkFrame(self.details_frame, fg_color="transparent")
 
         # Progress Panel
         progress_panel = ctk.CTkFrame(self.main_card, fg_color="#1f2937", corner_radius=6)
@@ -204,8 +236,13 @@ class MainWindow:
             self.status_var.set("Status: please enter a YouTube URL first")
             return
 
-        self.status_var.set("Status: analyzing URL...")
+        self.status_var.set("Status: analyzing URL and fetching formats...")
         self.analyze_button.configure(state="disabled")
+        
+        # Start loading animation
+        self.progress_bar.configure(mode="indeterminate")
+        self.progress_bar.start()
+        
         self.root.update_idletasks()
 
         # Run analysis in a background thread to prevent UI freezing
@@ -219,6 +256,16 @@ class MainWindow:
         try:
             metadata = analyze_url(url)
             
+            # Fetch formats using FormatManager (only if it's a single video)
+            video_options = []
+            audio_option = None
+            if not metadata.is_playlist:
+                fm = FormatManager(metadata.info_dict)
+                video_options = fm.video_options
+                audio_option = fm.audio_option
+                if not video_options and not audio_option:
+                    raise AnalysisError("No downloadable formats available for this video.")
+
             # Fetch thumbnail in background
             thumbnail_img = None
             if metadata.thumbnail_url:
@@ -230,14 +277,28 @@ class MainWindow:
                     logger.warning(f"Failed to download thumbnail: {thumb_err}")
 
             # Route back to main thread for UI updates
-            self.root.after(0, lambda: self._on_analysis_success(metadata, thumbnail_img))
+            self.root.after(0, lambda: self._on_analysis_success(metadata, thumbnail_img, video_options, audio_option))
         except Exception as exc:
             logger.exception("Analysis failed in background thread")
             self.root.after(0, lambda: self._on_analysis_failure(exc))
 
-    def _on_analysis_success(self, metadata: MediaMetadata, thumbnail_img: Image.Image | None) -> None:
+    def _on_analysis_success(
+        self, 
+        metadata: MediaMetadata, 
+        thumbnail_img: Image.Image | None,
+        video_options: list[DownloadOption],
+        audio_option: DownloadOption | None
+    ) -> None:
+        # Reset loading animation
+        self.progress_bar.stop()
+        self.progress_bar.configure(mode="determinate")
+        self.progress_bar.set(0.0)
         self.analyze_button.configure(state="normal")
         
+        self.metadata = metadata
+        self.video_options = video_options
+        self.audio_option = audio_option
+
         media_type = "playlist" if metadata.is_playlist else "video"
         self.status_var.set(f"Status: analyzed {media_type} successfully")
 
@@ -261,12 +322,20 @@ class MainWindow:
 
         self.details_frame.grid(row=0, column=1, sticky="nsew", padx=(0, 16), pady=16)
 
+        # Create structured subframes for metadata and format details
+        self.metadata_subframe = ctk.CTkFrame(self.details_frame, fg_color="transparent")
+        self.metadata_subframe.grid(row=0, column=0, columnspan=2, sticky="nsew")
+        self.format_subframe = ctk.CTkFrame(self.details_frame, fg_color="transparent")
+        self.format_subframe.grid(row=1, column=0, columnspan=2, sticky="nsew", pady=(10, 0))
+
         if metadata.is_playlist:
             details = [
                 ("Playlist Title:", metadata.title),
                 ("Playlist Owner:", metadata.uploader),
                 ("Total Videos:", f"{metadata.total_videos} videos"),
             ]
+            self.quality_combo.configure(state="disabled")
+            self.download_button.configure(state="normal")
         else:
             details = [
                 ("Title:", metadata.title),
@@ -275,20 +344,28 @@ class MainWindow:
                 ("Upload Date:", metadata.upload_date or "Unknown"),
                 ("Views:", metadata.view_count or "0"),
             ]
+            
+            # Setup Quality Dropdown values
+            self.download_button.configure(state="normal")
+            
+            # Trigger Mode Change logic to setup quality selectors and populate details
+            self._on_mode_change(self.download_mode_var.get())
 
-            # Populate quality dropdown for single video
-            self.quality_combo.configure(values=metadata.formats if metadata.formats else ["Best available"])
-            self.quality_var.set(metadata.formats[0] if metadata.formats else "Best available")
-
-        # Layout details
+        # Layout metadata details
         for i, (label_text, val_text) in enumerate(details):
-            lbl_name = ctk.CTkLabel(self.details_frame, text=label_text, font=("Segoe UI", 11, "bold"), text_color="#94a3b8", anchor="w")
-            lbl_name.grid(row=i, column=0, sticky="w", pady=4)
-            lbl_val = ctk.CTkLabel(self.details_frame, text=val_text, font=("Segoe UI", 11), text_color="#f8fafc", anchor="w", wraplength=450, justify="left")
-            lbl_val.grid(row=i, column=1, sticky="w", padx=(10, 0), pady=4)
+            lbl_name = ctk.CTkLabel(self.metadata_subframe, text=label_text, font=("Segoe UI", 11, "bold"), text_color="#94a3b8", anchor="w")
+            lbl_name.grid(row=i, column=0, sticky="w", pady=2)
+            lbl_val = ctk.CTkLabel(self.metadata_subframe, text=val_text, font=("Segoe UI", 11), text_color="#f8fafc", anchor="w", wraplength=450, justify="left")
+            lbl_val.grid(row=i, column=1, sticky="w", padx=(10, 0), pady=2)
 
     def _on_analysis_failure(self, exc: Exception) -> None:
+        self.progress_bar.stop()
+        self.progress_bar.configure(mode="determinate")
+        self.progress_bar.set(0.0)
+        
         self.analyze_button.configure(state="normal")
+        self.quality_combo.configure(state="disabled")
+        self.download_button.configure(state="disabled")
         self.status_var.set("Status: analysis failed")
 
         from analyzer import (
@@ -323,6 +400,100 @@ class MainWindow:
 
         # Modern CustomTkinter message box
         CTkMessagebox(title=title, message=message, icon=icon)
+
+    def _on_mode_change(self, mode: str) -> None:
+        is_analyzed_video = self.metadata is not None and not self.metadata.is_playlist
+        
+        if mode == "Audio (MP3)":
+            # Hide quality selector combobox, display Best Audio label placeholder
+            self.quality_combo.grid_forget()
+            self.best_audio_label.grid(row=1, column=1, columnspan=2, sticky="w", padx=(0, 16), pady=6)
+            self.quality_lbl.configure(text="Quality")
+        else:
+            # Show quality selector combobox, hide Best Audio label placeholder
+            self.best_audio_label.grid_forget()
+            self.quality_combo.grid(row=1, column=1, columnspan=2, sticky="ew", padx=(0, 16), pady=6)
+            self.quality_lbl.configure(text="Quality")
+            
+            # Populate combo values if analyzed
+            if is_analyzed_video and self.video_options:
+                labels = [opt.quality_label for opt in self.video_options]
+                self.quality_combo.configure(values=labels)
+                self.quality_combo.configure(state="normal")
+                self.quality_var.set(labels[0] if labels else "Best available")
+            else:
+                self.quality_combo.configure(values=["Best available"])
+                self.quality_combo.configure(state="disabled")
+                self.quality_var.set("Best available")
+
+        # Update dynamic format details in UI
+        self._update_format_details()
+
+    def _on_quality_change(self, quality: str) -> None:
+        self._update_format_details()
+
+    def _update_format_details(self) -> None:
+        # Clear previous formats info
+        for widget in self.format_subframe.winfo_children():
+            widget.destroy()
+
+        if self.metadata is None or self.metadata.is_playlist:
+            return
+
+        mode = self.download_mode_var.get()
+        
+        if mode == "Audio (MP3)":
+            if self.audio_option:
+                opt = self.audio_option
+                bitrate_str = f"{opt.audio_format.bitrate:.0f} kbps" if opt.audio_format and opt.audio_format.bitrate else "Unknown"
+                details = [
+                    ("Selected Quality:", "Best Audio"),
+                    ("Container:", "mp3"),
+                    ("Estimated Size:", format_size(opt.estimated_filesize)),
+                    ("Codec:", f"mp3 (source: {opt.audio_codec})"),
+                    ("Bitrate:", bitrate_str)
+                ]
+            else:
+                details = [
+                    ("Selected Quality:", "Best Audio"),
+                    ("Container:", "mp3"),
+                    ("Estimated Size:", "Unknown size"),
+                    ("Codec:", "mp3"),
+                    ("Bitrate:", "Unknown")
+                ]
+        else:
+            selected_quality = self.quality_var.get()
+            matching_opt = None
+            if self.video_options:
+                for opt in self.video_options:
+                    if opt.quality_label == selected_quality:
+                        matching_opt = opt
+                        break
+
+            if matching_opt:
+                # Format specific details
+                details = [
+                    ("Selected Quality:", matching_opt.quality_label),
+                    ("Container:", matching_opt.container),
+                    ("Estimated Size:", format_size(matching_opt.estimated_filesize)),
+                    ("Video Codec:", matching_opt.video_codec),
+                    ("Audio Codec:", matching_opt.audio_codec),
+                ]
+            else:
+                details = [
+                    ("Selected Quality:", selected_quality),
+                    ("Container:", "mp4"),
+                    ("Estimated Size:", "Unknown size"),
+                    ("Video Codec:", "Unknown"),
+                    ("Audio Codec:", "Unknown"),
+                ]
+
+        # Layout inside format_subframe with a distinct color theme (Sky Blue labels)
+        for i, (label_text, val_text) in enumerate(details):
+            lbl_name = ctk.CTkLabel(self.format_subframe, text=label_text, font=("Segoe UI", 11, "bold"), text_color="#38bdf8", anchor="w")
+            lbl_name.grid(row=i, column=0, sticky="w", pady=2)
+            lbl_val = ctk.CTkLabel(self.format_subframe, text=val_text, font=("Segoe UI", 11), text_color="#f1f5f9", anchor="w", wraplength=450, justify="left")
+            lbl_val.grid(row=i, column=1, sticky="w", padx=(10, 0), pady=2)
 
     def _download_action(self) -> None:
         url = self.url_entry.get().strip()
