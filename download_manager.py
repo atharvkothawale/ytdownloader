@@ -10,6 +10,8 @@ from typing import Any, Callable
 import yt_dlp
 from datetime import datetime
 
+from history_manager import HistoryManager
+
 logger = logging.getLogger("yt_downloader_pro.download_manager")
 
 
@@ -40,6 +42,20 @@ class DownloadTask:
     duration: float = 0.0
     avg_speed: float | None = None  # bytes/s
     conflict_option: str = "Rename"  # "Skip", "Overwrite", "Rename"
+    
+    # Advanced features fields
+    subtitles_enabled: bool = False
+    subtitles_auto: bool = False
+    subtitles_lang: str = "en"
+    subtitles_embed: bool = False
+    subtitles_separate: bool = False
+    chapters_embed: bool = False
+    chapters_export: bool = False
+    naming_template: str = "%(title)s"
+    audio_format: str = "mp3"
+    audio_quality: str = "Best Available"
+    uploader: str | None = "Unknown Channel"
+    is_playlist: bool = False
 
 
 class DownloadManager:
@@ -84,10 +100,9 @@ class DownloadManager:
             except Exception as folder_err:
                 raise PermissionError(f"Cannot write to output folder: {folder_err}") from folder_err
                 
-            # Build initial options
+            # Build options
             opts = self._build_options()
             
-            # Pre-extract info to inspect destination filename for existing file conflicts
             with yt_dlp.YoutubeDL(opts) as ydl:
                 info = ydl.extract_info(self.task.url, download=False)
                 
@@ -96,10 +111,13 @@ class DownloadManager:
                 
             # Predict output filename
             predicted_filename = ydl.prepare_filename(info)
-            final_ext = "mp4" if self.task.mode == "Video (MP4)" else "mp3"
+            
+            # Map suffix extension
+            is_audio = self.task.mode.startswith("Audio")
+            final_ext = self.task.audio_format if is_audio else "mp4"
             dest_path = Path(predicted_filename).with_suffix(f".{final_ext}")
             
-            # Evaluate file conflicts
+            # File conflict resolutions
             if dest_path.exists():
                 conflict = self.task.conflict_option
                 if conflict == "Skip":
@@ -127,7 +145,6 @@ class DownloadManager:
                     except Exception as del_err:
                         logger.warning(f"Failed to delete existing file: {del_err}")
                 elif conflict == "Rename":
-                    # Rename automatically by suffixing (1), (2), etc.
                     base_stem = dest_path.stem
                     suffix = dest_path.suffix
                     counter = 1
@@ -136,8 +153,6 @@ class DownloadManager:
                         new_path = dest_path.with_name(f"{base_stem} ({counter}){suffix}")
                         counter += 1
                     logger.info(f"File already exists. Renaming output to: {new_path}")
-                    
-                    # Update yt-dlp outtmpl to match the unique filename
                     opts["outtmpl"] = str(Path(self.task.output_dir) / f"{new_path.stem}.%(ext)s")
 
             # Run actual download
@@ -150,6 +165,11 @@ class DownloadManager:
             self.task.duration = duration
             self.task.finish_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             self.task.status = "Completed"
+            
+            # Export chapters if selected
+            if self.task.chapters_export:
+                from media_processor import MediaProcessor
+                MediaProcessor.export_chapters_to_file(info_run, dest_path)
             
             # Calculate average speed
             if self._speeds_collected:
@@ -167,7 +187,6 @@ class DownloadManager:
                 "avg_speed": self.task.avg_speed,
             }
             
-            # Log success
             self._log_to_file("Success")
             
         except Exception as e:
@@ -176,7 +195,6 @@ class DownloadManager:
             self.task.duration = duration
             self.task.finish_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             
-            # Check if it was cancelled
             if self._cancel_requested or "cancelled" in str(e).lower():
                 self.task.status = "Cancelled"
                 self._log_to_file("Cancelled")
@@ -199,10 +217,14 @@ class DownloadManager:
         except Exception:
             is_playlist = False
             
-        if is_playlist:
-            outtmpl = str(path / "%(playlist_index)03d - %(title)s.%(ext)s")
-        else:
-            outtmpl = str(path / "%(title)s.%(ext)s")
+        # Build file naming template
+        template_pattern = "%(title)s.%(ext)s"
+        if is_playlist or self.task.is_playlist or self.task.naming_template == "%(playlist_index)s - %(title)s":
+            template_pattern = "%(playlist_index)03d - %(title)s.%(ext)s"
+        elif self.task.naming_template == "%(channel)s - %(title)s":
+            template_pattern = "%(uploader)s - %(title)s.%(ext)s"
+
+        outtmpl = str(path / template_pattern)
 
         options: dict[str, Any] = {
             "quiet": True,
@@ -212,33 +234,64 @@ class DownloadManager:
             "progress_hooks": [self._progress_hook],
             "postprocessor_hooks": [self._postprocessor_hook],
             "ignoreerrors": True,
+            "postprocessors": [],
         }
 
-        # Set formats
-        if self.task.mode == "Audio (MP3)":
-            if self.task.audio_format_id:
-                options["format"] = f"{self.task.audio_format_id}"
+        # Subtitles configurations
+        if self.task.subtitles_enabled:
+            if self.task.subtitles_auto:
+                options["writeautomaticsub"] = True
             else:
-                options["format"] = "bestaudio/best"
-                
-            # Postprocessors to convert to mp3, embed thumbnail, and write metadata
-            options["postprocessors"] = [
-                {
-                    "key": "FFmpegExtractAudio",
-                    "preferredcodec": "mp3",
-                    "preferredquality": "0",  # VBR best quality
-                },
-                {
+                options["writesubtitles"] = True
+            options["subtitleslangs"] = [self.task.subtitles_lang]
+            
+            # Embed into MP4
+            if self.task.subtitles_embed and self.task.mode == "Video (MP4)":
+                options["postprocessors"].append({
+                    "key": "FFmpegEmbedSubtitle",
+                    "already_have_subtitle": False,
+                })
+
+        # Chapters embedding
+        if self.task.chapters_embed and self.task.mode == "Video (MP4)":
+            options["embedchapters"] = True
+
+        # Audio or Video stream mapping
+        if self.task.mode.startswith("Audio"):
+            codec = self.task.audio_format
+            
+            # Bitrate
+            q_map = {
+                "Best Available": "0",
+                "320 kbps": "320",
+                "256 kbps": "256",
+                "192 kbps": "192",
+                "128 kbps": "128",
+            }
+            quality = q_map.get(self.task.audio_quality, "0")
+            
+            options["format"] = self.task.audio_format_id if self.task.audio_format_id else "bestaudio/best"
+            
+            options["postprocessors"].append({
+                "key": "FFmpegExtractAudio",
+                "preferredcodec": codec,
+                "preferredquality": quality,
+            })
+            
+            # Embed artwork thumbnails
+            if codec in ["mp3", "m4a"]:
+                options["postprocessors"].append({
                     "key": "FFmpegEmbedThumbnail",
-                },
-                {
-                    "key": "FFmpegMetadata",
-                    "add_metadata": True,
-                }
-            ]
-            options["writethumbnail"] = True  # Required for FFmpegEmbedThumbnail
+                })
+                options["writethumbnail"] = True
+                
+            # Embed Metadata tags
+            options["postprocessors"].append({
+                "key": "FFmpegMetadata",
+                "add_metadata": True,
+            })
         else:
-            # Video Mode
+            # Video mode format selection
             if self.task.video_format_id and self.task.audio_format_id:
                 options["format"] = f"{self.task.video_format_id}+{self.task.audio_format_id}/best"
             elif self.task.video_format_id:
@@ -247,6 +300,12 @@ class DownloadManager:
                 options["format"] = "bestvideo+bestaudio/best"
                 
             options["merge_output_format"] = "mp4"
+            
+            # Embed Metadata tags in Video mode as well
+            options["postprocessors"].append({
+                "key": "FFmpegMetadata",
+                "add_metadata": True,
+            })
 
         return options
 
@@ -254,7 +313,6 @@ class DownloadManager:
         if self._cancel_requested:
             raise DownloadCancelledError("Download cancelled by user")
             
-        # Capture size and speed stats
         total = data.get("total_bytes") or data.get("total_bytes_estimate")
         if total:
             self.task.total_size = int(total)
@@ -286,9 +344,10 @@ class DownloadManager:
                 self.status_callback("Converting Audio...")
             elif pp_name == "FFmpegEmbedThumbnail":
                 self.status_callback("Embedding Thumbnail...")
+            elif pp_name == "FFmpegEmbedSubtitle":
+                self.status_callback("Embedding Subtitles...")
 
     def _log_to_file(self, status: str, error_msg: str | None = None) -> None:
-        # Columns: Start Time, Finish Time, Average Speed, Output Path, File Size, Status, Duration, Errors
         start = self.task.start_time or "N/A"
         finish = self.task.finish_time or "N/A"
         
@@ -337,6 +396,9 @@ class DownloadQueue:
         self.failed_count = 0
         self.total_bytes_transferred = 0
         self.total_elapsed_time = 0.0
+        
+        # History logger database
+        self.history_db = HistoryManager()
 
     def add_task(
         self,
@@ -347,6 +409,18 @@ class DownloadQueue:
         video_format_id: str | None = None,
         audio_format_id: str | None = None,
         conflict_option: str = "Rename",
+        subtitles_enabled: bool = False,
+        subtitles_auto: bool = False,
+        subtitles_lang: str = "en",
+        subtitles_embed: bool = False,
+        subtitles_separate: bool = False,
+        chapters_embed: bool = False,
+        chapters_export: bool = False,
+        naming_template: str = "%(title)s",
+        audio_format: str = "mp3",
+        audio_quality: str = "Best Available",
+        uploader: str | None = "Unknown Channel",
+        is_playlist: bool = False,
     ) -> DownloadTask:
         """Creates and appends a task to the queue, initiating execution if idle."""
         task = DownloadTask(
@@ -359,6 +433,18 @@ class DownloadQueue:
             audio_format_id=audio_format_id,
             status="Pending",
             conflict_option=conflict_option,
+            subtitles_enabled=subtitles_enabled,
+            subtitles_auto=subtitles_auto,
+            subtitles_lang=subtitles_lang,
+            subtitles_embed=subtitles_embed,
+            subtitles_separate=subtitles_separate,
+            chapters_embed=chapters_embed,
+            chapters_export=chapters_export,
+            naming_template=naming_template,
+            audio_format=audio_format,
+            audio_quality=audio_quality,
+            uploader=uploader,
+            is_playlist=is_playlist,
         )
         
         with self._lock:
@@ -387,6 +473,23 @@ class DownloadQueue:
                     elif task.status == "Pending":
                         task.status = "Cancelled"
                         task.finish_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                        
+                        # Add cancelled pending records directly to DB history
+                        self.history_db.add_record(
+                            task_id=task.task_id,
+                            title=task.title,
+                            url=task.url,
+                            duration="0s",
+                            file_size=0,
+                            output_path=task.output_dir,
+                            status="Cancelled",
+                            download_type=task.mode,
+                            quality=task.quality_label,
+                            thumbnail_path=None,
+                            uploader=task.uploader,
+                            is_playlist=task.is_playlist,
+                            avg_speed=0.0
+                        )
                     break
         self._notify_changed()
 
@@ -440,7 +543,6 @@ class DownloadQueue:
         with self._lock:
             self._is_running = False
             
-        # Queue complete stats
         total_duration = time.time() - self.queue_start_time
         avg_speed_combined = None
         if self.total_bytes_transferred > 0 and total_duration > 0:
@@ -471,7 +573,6 @@ class DownloadQueue:
             
         self._notify_changed()
         
-        # Instantiate manager
         manager = DownloadManager(
             task=task,
             progress_callback=lambda data: self._on_progress(task, data),
@@ -485,6 +586,26 @@ class DownloadQueue:
         # Blocking call
         manager.start()
         
+        # Add to history SQLite database log on complete/failed/cancelled
+        try:
+            self.history_db.add_record(
+                task_id=task.task_id,
+                title=task.title,
+                url=task.url,
+                duration=f"{task.duration:.1f}s",
+                file_size=task.total_size or 0,
+                output_path=task.output_dir,
+                status=task.status,
+                download_type=task.mode,
+                quality=task.quality_label,
+                thumbnail_path=None,
+                uploader=task.uploader,
+                is_playlist=task.is_playlist,
+                avg_speed=task.avg_speed
+            )
+        except Exception as db_err:
+            logger.error(f"Failed to save record to history DB: {db_err}")
+
         # Task has finished running
         with self._lock:
             self._active_manager = None
@@ -499,7 +620,6 @@ class DownloadQueue:
         self._notify_changed()
 
     def _on_progress(self, task: DownloadTask, data: dict[str, Any]) -> None:
-        # Calculate percentage
         downloaded = data.get("downloaded_bytes", 0)
         total = data.get("total_bytes") or data.get("total_bytes_estimate") or 1
         percent = min(100.0, (downloaded / total) * 100.0)

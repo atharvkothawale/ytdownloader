@@ -1,0 +1,22 @@
+{
+    "last_download_folder": "",
+    "last_quality": "Best available",
+    "last_output_format": "mp4",
+    "last_download_type": "Video (MP4)",
+    "last_window_size": "1220x860",
+    "last_window_position": "+100+100",
+    "theme": "dark",
+    "accent_color": "blue",
+    "font_size": 11,
+    "auto_create_folders": true,
+    "skip_existing_files": true,
+    "auto_update_ytdlp": false,
+    "auto_update_ffmpeg": false,
+    "auto_open_folder": false,
+    "delete_temp_files": true,
+    "concurrent_downloads": 1,
+    "retry_attempts": 3,
+    "buffer_size": 1024,
+    "logging_enabled": true,
+    "log_location": ""
+}
