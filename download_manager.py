@@ -39,6 +39,7 @@ class DownloadTask:
     finish_time: str | None = None
     duration: float = 0.0
     avg_speed: float | None = None  # bytes/s
+    conflict_option: str = "Rename"  # "Skip", "Overwrite", "Rename"
 
 
 class DownloadManager:
@@ -83,15 +84,68 @@ class DownloadManager:
             except Exception as folder_err:
                 raise PermissionError(f"Cannot write to output folder: {folder_err}") from folder_err
                 
-            # Build options
+            # Build initial options
             opts = self._build_options()
             
-            # Run download
+            # Pre-extract info to inspect destination filename for existing file conflicts
             with yt_dlp.YoutubeDL(opts) as ydl:
-                info = ydl.extract_info(self.task.url, download=True)
+                info = ydl.extract_info(self.task.url, download=False)
+                
+            if not isinstance(info, dict):
+                raise AnalysisError("Failed to extract video info for downloading.")
+                
+            # Predict output filename
+            predicted_filename = ydl.prepare_filename(info)
+            final_ext = "mp4" if self.task.mode == "Video (MP4)" else "mp3"
+            dest_path = Path(predicted_filename).with_suffix(f".{final_ext}")
+            
+            # Evaluate file conflicts
+            if dest_path.exists():
+                conflict = self.task.conflict_option
+                if conflict == "Skip":
+                    logger.info(f"File already exists. Skipping download: {dest_path}")
+                    self.task.status = "Completed"
+                    self.task.progress = 100.0
+                    self.task.total_size = dest_path.stat().st_size
+                    self.task.finish_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    
+                    if self.completion_callback:
+                        self.completion_callback({
+                            "title": info.get("title", self.task.title),
+                            "mode": self.task.mode,
+                            "quality": self.task.quality_label,
+                            "output_dir": self.task.output_dir,
+                            "duration": 0.0,
+                            "total_size": self.task.total_size,
+                            "avg_speed": None,
+                        }, None)
+                    return
+                elif conflict == "Overwrite":
+                    logger.info(f"File already exists. Overwriting: {dest_path}")
+                    try:
+                        dest_path.unlink()
+                    except Exception as del_err:
+                        logger.warning(f"Failed to delete existing file: {del_err}")
+                elif conflict == "Rename":
+                    # Rename automatically by suffixing (1), (2), etc.
+                    base_stem = dest_path.stem
+                    suffix = dest_path.suffix
+                    counter = 1
+                    new_path = dest_path
+                    while new_path.exists():
+                        new_path = dest_path.with_name(f"{base_stem} ({counter}){suffix}")
+                        counter += 1
+                    logger.info(f"File already exists. Renaming output to: {new_path}")
+                    
+                    # Update yt-dlp outtmpl to match the unique filename
+                    opts["outtmpl"] = str(Path(self.task.output_dir) / f"{new_path.stem}.%(ext)s")
+
+            # Run actual download
+            with yt_dlp.YoutubeDL(opts) as ydl_run:
+                info_run = ydl_run.extract_info(self.task.url, download=True)
                 
             duration = time.time() - self._start_time
-            title = info.get("title", self.task.url) if isinstance(info, dict) else self.task.url
+            title = info_run.get("title", self.task.title) if isinstance(info_run, dict) else self.task.title
             self.task.title = title
             self.task.duration = duration
             self.task.finish_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -157,7 +211,7 @@ class DownloadManager:
             "paths": {"home": str(path)},
             "progress_hooks": [self._progress_hook],
             "postprocessor_hooks": [self._postprocessor_hook],
-            "ignoreerrors": True,  # Continue playlist items when possible
+            "ignoreerrors": True,
         }
 
         # Set formats
@@ -292,6 +346,7 @@ class DownloadQueue:
         quality_label: str,
         video_format_id: str | None = None,
         audio_format_id: str | None = None,
+        conflict_option: str = "Rename",
     ) -> DownloadTask:
         """Creates and appends a task to the queue, initiating execution if idle."""
         task = DownloadTask(
@@ -303,6 +358,7 @@ class DownloadQueue:
             video_format_id=video_format_id,
             audio_format_id=audio_format_id,
             status="Pending",
+            conflict_option=conflict_option,
         )
         
         with self._lock:
@@ -377,7 +433,6 @@ class DownloadQueue:
                         break
             
             if next_task is None:
-                # No more pending tasks
                 break
                 
             self._run_task(next_task)
@@ -417,18 +472,17 @@ class DownloadQueue:
         self._notify_changed()
         
         # Instantiate manager
-        start_time = time.time()
         manager = DownloadManager(
             task=task,
             progress_callback=lambda data: self._on_progress(task, data),
             status_callback=self._on_status,
-            completion_callback=None,  # Handled synchronously in this thread
+            completion_callback=None,
         )
         
         with self._lock:
             self._active_manager = manager
             
-        # Blocking call (runs in our sequential worker thread)
+        # Blocking call
         manager.start()
         
         # Task has finished running
@@ -455,7 +509,6 @@ class DownloadQueue:
             self.on_task_progress(task, data)
 
     def _on_status(self, status: str) -> None:
-        # Propagate postprocessing status changes
         self._notify_changed()
 
     def _notify_changed(self) -> None:
