@@ -58,6 +58,7 @@ class DownloadTask:
     audio_quality: str = "Best Available"
     uploader: str | None = "Unknown Channel"
     is_playlist: bool = False
+    playlist_index: int | None = None
 
 
 class DownloadManager:
@@ -225,6 +226,10 @@ class DownloadManager:
             template_pattern = "%(playlist_index)03d - %(title)s.%(ext)s"
         elif self.task.naming_template == "%(channel)s - %(title)s":
             template_pattern = "%(uploader)s - %(title)s.%(ext)s"
+
+        if self.task.playlist_index is not None:
+            template_pattern = template_pattern.replace("%(playlist_index)03d", f"{self.task.playlist_index:03d}")
+            template_pattern = template_pattern.replace("%(playlist_index)s", str(self.task.playlist_index))
 
         outtmpl = str(path / template_pattern)
 
@@ -423,6 +428,7 @@ class DownloadQueue:
         audio_quality: str = "Best Available",
         uploader: str | None = "Unknown Channel",
         is_playlist: bool = False,
+        playlist_index: int | None = None,
     ) -> DownloadTask:
         """Creates and appends a task to the queue, initiating execution if idle."""
         task = DownloadTask(
@@ -447,6 +453,7 @@ class DownloadQueue:
             audio_quality=audio_quality,
             uploader=uploader,
             is_playlist=is_playlist,
+            playlist_index=playlist_index,
         )
         
         with self._lock:

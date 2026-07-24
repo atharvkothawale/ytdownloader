@@ -865,6 +865,7 @@ class MainWindow:
                     audio_quality=self.audio_quality_var.get(),
                     uploader=item.uploader or "Unknown Channel",
                     is_playlist=True,
+                    playlist_index=item.index,
                 )
             self.status_var.set(f"Status: Added {len(download_items)} playlist items to queue")
         else:
