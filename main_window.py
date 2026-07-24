@@ -113,7 +113,7 @@ class MainWindow:
         ctk.set_default_color_theme(self.settings.get("accent_color", "blue"))
         
         # Set Window geometry size
-        self.root.geometry(self.settings.get("last_window_size", "1220x860"))
+        self.root.geometry(self.settings.get("last_window_size", "1220x900"))
         self.root.geometry(self.settings.get("last_window_position", ""))
         self.root.minsize(1150, 800)
         self.root.configure(fg_color="#0f172a")
@@ -259,8 +259,8 @@ class MainWindow:
         self.main_card.grid(row=1, column=0, sticky="nsew", padx=24, pady=(6, 24))
         self.main_card.grid_columnconfigure(0, weight=1)
         
-        self.main_card.grid_rowconfigure(5, weight=1)  # Resizable preview panel
-        self.main_card.grid_rowconfigure(7, weight=1)  # Resizable queue panel
+        self.main_card.grid_rowconfigure(5, weight=1, minsize=180)  # Resizable preview panel
+        self.main_card.grid_rowconfigure(7, weight=1, minsize=100)  # Resizable queue panel
 
         # URL Input
         url_lbl = ctk.CTkLabel(self.main_card, text="Enter URL", font=("Segoe UI", 11, "bold"), text_color="#e2e8f0", anchor="w")
