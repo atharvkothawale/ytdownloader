@@ -12,11 +12,86 @@ import requests
 from CTkMessagebox import CTkMessagebox
 
 from analyzer import analyze_url, MediaMetadata, AnalysisError
-from downloader import Downloader
 from format_manager import FormatManager, DownloadOption, format_size
-from download_manager import DownloadManager, DownloadCancelledError
+from download_manager import DownloadManager, DownloadCancelledError, DownloadQueue, DownloadTask
 
 logger = logging.getLogger("yt_downloader_pro.main_window")
+
+
+class DownloadCompleteDialog(ctk.CTkToplevel):
+    """Custom modal window to notify completion of downloads with folder actions."""
+
+    def __init__(self, parent: ctk.CTk, title: str, output_dir: str, elapsed_time: float) -> None:
+        super().__init__(parent)
+        self.title("Download Complete")
+        self.geometry("460x230")
+        self.resizable(False, False)
+        self.configure(fg_color="#0f172a")
+
+        # Make modal dialog centered over parent
+        self.transient(parent)
+        self.grab_set()
+
+        self.update_idletasks()
+        parent_x = parent.winfo_x()
+        parent_y = parent.winfo_y()
+        parent_w = parent.winfo_width()
+        parent_h = parent.winfo_height()
+        x = parent_x + (parent_w - 460) // 2
+        y = parent_y + (parent_h - 230) // 2
+        self.geometry(f"+{x}+{y}")
+
+        # Components
+        lbl_header = ctk.CTkLabel(self, text="Download Complete! 🎉", font=("Segoe UI", 16, "bold"), text_color="#38bdf8")
+        lbl_header.pack(pady=(20, 10))
+
+        lbl_file = ctk.CTkLabel(self, text=f"File: {title}", font=("Segoe UI", 11), text_color="#f8fafc", wraplength=400, justify="center")
+        lbl_file.pack(pady=4)
+
+        lbl_dir = ctk.CTkLabel(self, text=f"Output: {output_dir}", font=("Segoe UI", 10), text_color="#94a3b8", wraplength=400, justify="center")
+        lbl_dir.pack(pady=4)
+
+        lbl_time = ctk.CTkLabel(self, text=f"Elapsed Time: {elapsed_time:.1f}s", font=("Segoe UI", 10), text_color="#94a3b8")
+        lbl_time.pack(pady=4)
+
+        btn_frame = ctk.CTkFrame(self, fg_color="transparent")
+        btn_frame.pack(pady=(16, 16))
+
+        btn_open = ctk.CTkButton(
+            btn_frame, 
+            text="Open Folder", 
+            font=("Segoe UI", 11, "bold"), 
+            fg_color="#2563eb", 
+            hover_color="#1d4ed8", 
+            text_color="#ffffff", 
+            width=130, 
+            height=30,
+            command=self._open_folder
+        )
+        btn_open.pack(side="left", padx=8)
+
+        btn_close = ctk.CTkButton(
+            btn_frame, 
+            text="Download Another", 
+            font=("Segoe UI", 11, "bold"), 
+            fg_color="#1f2937", 
+            hover_color="#374151", 
+            text_color="#e5e7eb", 
+            width=130, 
+            height=30,
+            command=self.destroy
+        )
+        btn_close.pack(side="left", padx=8)
+
+        self.output_dir = output_dir
+
+    def _open_folder(self) -> None:
+        import os
+        try:
+            os.startfile(self.output_dir)
+        except Exception as e:
+            logger.error(f"Failed to open folder: {e}")
+        self.destroy()
 
 
 class MainWindow:
@@ -25,24 +100,25 @@ class MainWindow:
     def __init__(self, root: ctk.CTk) -> None:
         self.root = root
         self.root.title("YT Downloader Pro")
-        self.root.geometry("1180x760")
-        self.root.minsize(1000, 700)
+        self.root.geometry("1180x820")
+        self.root.minsize(1050, 750)
         self.root.configure(fg_color="#0f172a")
 
         self.download_mode_var = ctk.StringVar(value="Video (MP4)")
         self.output_dir_var = ctk.StringVar(value=str(self._default_output_dir()))
-        self.status_var = ctk.StringVar(value="Status: waiting for input")
+        self.status_var = ctk.StringVar(value="Status: Ready")
         self.quality_var = ctk.StringVar(value="Best available")
-        
-        self.downloader = Downloader()
         
         # Format detection options state
         self.metadata: MediaMetadata | None = None
         self.video_options: list[DownloadOption] = []
         self.audio_option: DownloadOption | None = None
         
-        # Background download engine state
-        self.current_download: DownloadManager | None = None
+        # Download Queue Manager
+        self.queue = DownloadQueue()
+        self.queue.on_queue_changed = self._on_queue_changed
+        self.queue.on_task_progress = self._on_task_progress
+        self.queue.on_queue_complete = self._on_queue_complete
 
         self._build_ui()
 
@@ -97,11 +173,12 @@ class MainWindow:
         header_subtitle = ctk.CTkLabel(header, text="Paste a YouTube URL and choose your preferred download options.", font=("Segoe UI", 10), text_color="#94a3b8", anchor="w")
         header_subtitle.grid(row=1, column=0, sticky="w", padx=24, pady=(0, 20))
 
-        # Main Card (where inputs and preview reside)
+        # Main Card (where inputs, dashboard, and queue reside)
         self.main_card = ctk.CTkFrame(content, fg_color="#111827", corner_radius=8)
         self.main_card.grid(row=1, column=0, sticky="nsew", padx=28, pady=(9, 20))
         self.main_card.grid_columnconfigure(0, weight=1)
         self.main_card.grid_rowconfigure(4, weight=1)  # Preview panel is resizable
+        self.main_card.grid_rowconfigure(6, weight=1)  # Queue frame is resizable
 
         # URL Input
         url_lbl = ctk.CTkLabel(self.main_card, text="Enter URL", font=("Segoe UI", 11, "bold"), text_color="#e2e8f0", anchor="w")
@@ -166,22 +243,8 @@ class MainWindow:
         self.analyze_button = ctk.CTkButton(action_row, text="Analyze", font=("Segoe UI", 11, "bold"), fg_color="#1f2937", hover_color="#374151", text_color="#e5e7eb", border_width=1, border_color="#374151", width=120, height=35, command=self._analyze_action)
         self.analyze_button.pack(side="left", padx=(0, 10))
 
-        self.download_button = ctk.CTkButton(action_row, text="Download", font=("Segoe UI", 11, "bold"), fg_color="#2563eb", hover_color="#1d4ed8", text_color="#ffffff", width=120, height=35, state="disabled", command=self._download_action)
+        self.download_button = ctk.CTkButton(action_row, text="Add to Queue", font=("Segoe UI", 11, "bold"), fg_color="#2563eb", hover_color="#1d4ed8", text_color="#ffffff", width=120, height=35, state="disabled", command=self._download_action)
         self.download_button.pack(side="left", padx=(0, 10))
-
-        self.cancel_button = ctk.CTkButton(
-            action_row, 
-            text="Cancel", 
-            font=("Segoe UI", 11, "bold"), 
-            fg_color="#ef4444", 
-            hover_color="#dc2626", 
-            text_color="#ffffff", 
-            width=120, 
-            height=35, 
-            state="disabled", 
-            command=self._cancel_action
-        )
-        self.cancel_button.pack(side="left")
 
         # Preview Panel
         self.preview_panel = ctk.CTkFrame(self.main_card, fg_color="#1f2937", corner_radius=6)
@@ -208,20 +271,47 @@ class MainWindow:
         self.metadata_subframe = ctk.CTkFrame(self.details_frame, fg_color="transparent")
         self.format_subframe = ctk.CTkFrame(self.details_frame, fg_color="transparent")
 
-        # Progress Panel
-        progress_panel = ctk.CTkFrame(self.main_card, fg_color="#1f2937", corner_radius=6)
-        progress_panel.grid(row=5, column=0, sticky="ew", padx=24, pady=(0, 24))
-        progress_panel.grid_columnconfigure(0, weight=1)
+        # Progress Dashboard Panel
+        self.progress_panel = ctk.CTkFrame(self.main_card, fg_color="#1f2937", corner_radius=6)
+        self.progress_panel.grid(row=5, column=0, sticky="ew", padx=24, pady=(0, 16))
+        self.progress_panel.grid_columnconfigure(0, weight=1)
 
-        progress_lbl = ctk.CTkLabel(progress_panel, text="Progress", font=("Segoe UI", 11, "bold"), text_color="#e2e8f0", anchor="w")
-        progress_lbl.grid(row=0, column=0, sticky="w", padx=16, pady=(12, 4))
-        
-        self.progress_bar = ctk.CTkProgressBar(progress_panel, progress_color="#2563eb", fg_color="#111827", height=8)
-        self.progress_bar.grid(row=1, column=0, sticky="ew", padx=16, pady=4)
+        # Filename Header
+        self.current_file_label = ctk.CTkLabel(self.progress_panel, text="No active download", font=("Segoe UI", 11, "bold"), text_color="#f8fafc", anchor="w")
+        self.current_file_label.grid(row=0, column=0, sticky="w", padx=16, pady=(12, 4))
+
+        # Twin Progress Bar 1: Current Video Progress
+        self.video_progress_lbl = ctk.CTkLabel(self.progress_panel, text="Current Video: 0%", font=("Segoe UI", 10), text_color="#cbd5e1", anchor="w")
+        self.video_progress_lbl.grid(row=1, column=0, sticky="w", padx=16, pady=(0, 2))
+        self.progress_bar = ctk.CTkProgressBar(self.progress_panel, progress_color="#3b82f6", fg_color="#111827", height=8)
+        self.progress_bar.grid(row=2, column=0, sticky="ew", padx=16, pady=(0, 8))
         self.progress_bar.set(0.0)
-        
-        self.progress_status_label = ctk.CTkLabel(progress_panel, textvariable=self.status_var, font=("Segoe UI", 10), text_color="#cbd5e1", anchor="w")
-        self.progress_status_label.grid(row=2, column=0, sticky="w", padx=16, pady=(4, 12))
+
+        # Twin Progress Bar 2: Overall Playlist Progress (hidden initially)
+        self.playlist_progress_lbl = ctk.CTkLabel(self.progress_panel, text="Overall Progress: 0%", font=("Segoe UI", 10), text_color="#cbd5e1", anchor="w")
+        self.playlist_progress_bar = ctk.CTkProgressBar(self.progress_panel, progress_color="#22c55e", fg_color="#111827", height=8)
+
+        # Stats Grid Frame
+        self.stats_frame = ctk.CTkFrame(self.progress_panel, fg_color="transparent")
+        self.stats_frame.grid(row=5, column=0, sticky="ew", padx=16, pady=(4, 12))
+        self.stats_frame.grid_columnconfigure((0, 1, 2, 3), weight=1)
+
+        self.stat_status = ctk.CTkLabel(self.stats_frame, text="Status: Ready", font=("Segoe UI", 10), text_color="#94a3b8", anchor="w")
+        self.stat_status.grid(row=0, column=0, sticky="w")
+
+        self.stat_speed = ctk.CTkLabel(self.stats_frame, text="Speed: N/A", font=("Segoe UI", 10), text_color="#94a3b8", anchor="w")
+        self.stat_speed.grid(row=0, column=1, sticky="w")
+
+        self.stat_eta = ctk.CTkLabel(self.stats_frame, text="ETA: N/A", font=("Segoe UI", 10), text_color="#94a3b8", anchor="w")
+        self.stat_eta.grid(row=0, column=2, sticky="w")
+
+        self.stat_size = ctk.CTkLabel(self.stats_frame, text="Downloaded: N/A", font=("Segoe UI", 10), text_color="#94a3b8", anchor="w")
+        self.stat_size.grid(row=0, column=3, sticky="w")
+
+        # Scrollable Download Queue Panel
+        self.queue_frame = ctk.CTkScrollableFrame(self.main_card, label_text="Download Queue", height=150, fg_color="#1f2937")
+        self.queue_frame.grid(row=6, column=0, sticky="ew", padx=24, pady=(0, 24))
+        self._render_queue()
 
         # Bottom Status Bar
         status_bar = ctk.CTkFrame(self.root, fg_color="#111827", corner_radius=0, height=35)
@@ -249,17 +339,16 @@ class MainWindow:
             self.output_dir_var.set(folder)
 
     def _set_ui_state_downloading(self) -> None:
-        """Locks all inputs and enables the Cancel button while downloading."""
+        """Locks settings panel while downloads run. Spaced sequentially inside queue."""
         self.url_entry.configure(state="disabled")
         self.mode_combo.configure(state="disabled")
         self.quality_combo.configure(state="disabled")
         self.folder_button.configure(state="disabled")
         self.analyze_button.configure(state="disabled")
         self.download_button.configure(state="disabled")
-        self.cancel_button.configure(state="normal")
 
     def _set_ui_state_idle(self) -> None:
-        """Restores control state when the download finishes, fails, or is cancelled."""
+        """Unlocks configuration inputs when queue processes finish or idle."""
         self.url_entry.configure(state="normal")
         self.mode_combo.configure(state="normal")
         self.folder_button.configure(state="normal")
@@ -273,8 +362,6 @@ class MainWindow:
         else:
             self.download_button.configure(state="disabled")
             self.quality_combo.configure(state="disabled")
-            
-        self.cancel_button.configure(state="disabled")
 
     def _analyze_action(self) -> None:
         url = self.url_entry.get().strip()
@@ -282,7 +369,7 @@ class MainWindow:
             self.status_var.set("Status: please enter a YouTube URL first")
             return
 
-        self.status_var.set("Status: analyzing URL and fetching formats...")
+        self.status_var.set("Status: Analyzing...")
         self.analyze_button.configure(state="disabled")
         self.download_button.configure(state="disabled")
         self.quality_combo.configure(state="disabled")
@@ -290,6 +377,7 @@ class MainWindow:
         # Start loading animation
         self.progress_bar.configure(mode="indeterminate")
         self.progress_bar.start()
+        self.stat_status.configure(text="Status: Fetching Information...")
         
         self.root.update_idletasks()
 
@@ -341,16 +429,17 @@ class MainWindow:
         self.progress_bar.stop()
         self.progress_bar.configure(mode="determinate")
         self.progress_bar.set(0.0)
+        self.stat_status.configure(text="Status: Ready")
         
         self.metadata = metadata
         self.video_options = video_options
         self.audio_option = audio_option
         
-        # Restore idle UI locks based on success state
+        # Restore controls state
         self._set_ui_state_idle()
 
         media_type = "playlist" if metadata.is_playlist else "video"
-        self.status_var.set(f"Status: analyzed {media_type} successfully")
+        self.status_var.set(f"Status: Analyzed {media_type} successfully")
 
         # Hide placeholder
         self.preview_placeholder.grid_forget()
@@ -408,13 +497,14 @@ class MainWindow:
         self.progress_bar.stop()
         self.progress_bar.configure(mode="determinate")
         self.progress_bar.set(0.0)
+        self.stat_status.configure(text="Status: Ready")
         
         self.metadata = None
         self.video_options = []
         self.audio_option = None
         
         self._set_ui_state_idle()
-        self.status_var.set("Status: analysis failed")
+        self.status_var.set("Status: Ready")
 
         from analyzer import (
             InvalidURLError,
@@ -446,7 +536,6 @@ class MainWindow:
         else:
             message = f"An unexpected error occurred during URL analysis:\n{str(exc)}"
 
-        # Modern CustomTkinter message box
         CTkMessagebox(title=title, message=message, icon=icon)
 
     def _on_mode_change(self, mode: str) -> None:
@@ -549,13 +638,7 @@ class MainWindow:
             self.status_var.set("Status: please enter a YouTube URL first")
             return
 
-        self.progress_bar.set(0.0)
-        self.status_var.set("Status: starting download...")
-        
-        # Lock UI controls and enable Cancel
-        self._set_ui_state_downloading()
-
-        # Parse selected formats to download
+        # Parse selected formats
         video_format_id = None
         audio_format_id = None
         
@@ -579,123 +662,211 @@ class MainWindow:
                     if matching_opt.audio_format:
                         audio_format_id = matching_opt.audio_format.format_id
 
-        # Instantiate background thread DownloadManager
-        self.current_download = DownloadManager(
+        # Add to Sequential Queue
+        self.queue.add_task(
             url=url,
             output_dir=self.output_dir_var.get(),
             mode=self.download_mode_var.get(),
             quality_label=self.quality_var.get(),
             video_format_id=video_format_id,
             audio_format_id=audio_format_id,
-            progress_callback=self._update_progress,
-            status_callback=self._update_status,
-            completion_callback=self._on_download_complete,
         )
-        self.current_download.start()
+        self.status_var.set("Status: Added task to queue")
 
-    def _cancel_action(self) -> None:
-        if self.current_download:
-            self.status_var.set("Status: cancelling download...")
-            self.current_download.cancel()
+    def _on_queue_changed(self) -> None:
+        self.root.after(0, self._render_queue)
+        
+        # Check active execution state to toggle locks
+        active = self.queue.active_task
+        if active:
+            self.root.after(0, self._set_ui_state_downloading)
+        else:
+            self.root.after(0, self._set_ui_state_idle)
 
-    def _update_status(self, status: str) -> None:
-        self.root.after(0, lambda: self.status_var.set(f"Status: {status}"))
+    def _on_task_progress(self, task: DownloadTask, data: dict[str, Any]) -> None:
+        self.root.after(0, lambda: self._update_dashboard(task, data))
 
-    def _on_download_complete(self, result: dict[str, Any] | None, error: Exception | None) -> None:
-        self.root.after(0, self._set_ui_state_idle)
-        self.current_download = None
+    def _on_queue_complete(self, summary: dict[str, Any]) -> None:
+        self.root.after(0, lambda: self._show_queue_summary(summary))
 
-        if error:
-            # Check if cancelled
-            if isinstance(error, DownloadCancelledError) or "cancelled" in str(error).lower():
-                self.root.after(0, lambda: self.status_var.set("Status: download cancelled"))
-                self.root.after(0, lambda: self.progress_bar.set(0.0))
-                return
+    def _update_dashboard(self, task: DownloadTask, data: dict[str, Any]) -> None:
+        # File title header
+        title = task.title
+        self.current_file_label.configure(text=f"Downloading: {title}")
 
-            err_msg = str(error)
-            title = "Download Failed"
-            icon = "cancel"
+        # Current progress bar 1
+        progress_val = task.progress / 100.0
+        self.progress_bar.set(progress_val)
+        self.video_progress_lbl.configure(text=f"Current Video: {task.progress:.1f}%")
 
-            # Route custom errors to friendly CTkMessagebox alerts
-            if "ffmpeg" in err_msg.lower() or "ffprobe" in err_msg.lower():
-                title = "Missing FFmpeg"
-                message = "FFmpeg is missing from your system. FFmpeg is required to merge streams or transcode audio. Please install FFmpeg and add it to your PATH."
-            elif "permission" in err_msg.lower():
-                title = "Permission Denied"
-                message = "Access denied to output folder. Please select a folder with write permissions."
-            elif "space" in err_msg.lower() or "disk full" in err_msg.lower():
-                title = "Disk Full"
-                message = "The disk is full. Please clear space or select another output folder."
-            elif "copyright" in err_msg.lower():
-                title = "Copyright Restrictions"
-                message = "This video cannot be downloaded due to copyright restrictions."
-            elif "private" in err_msg.lower():
-                title = "Private Video"
-                message = "This content is private and cannot be downloaded."
-            elif "removed" in err_msg.lower() or "deleted" in err_msg.lower() or "not found" in err_msg.lower():
-                title = "Video Removed"
-                message = "This content has been removed and is unavailable."
-            else:
-                message = f"Unable to download media:\n{err_msg}"
+        # Overall progress bar 2 for playlist downloads
+        info_dict = data.get("info_dict", {})
+        playlist_index = info_dict.get("playlist_index")
+        playlist_count = info_dict.get("playlist_count")
 
-            self.root.after(0, lambda: CTkMessagebox(title=title, message=message, icon=icon))
-            self.root.after(0, lambda: self.status_var.set("Status: download failed"))
+        if playlist_index is not None and playlist_count is not None:
+            # Grid twin bars if playlist active
+            if not self.playlist_progress_bar.winfo_manager():
+                self.playlist_progress_lbl.grid(row=3, column=0, sticky="w", padx=16, pady=(0, 2))
+                self.playlist_progress_bar.grid(row=4, column=0, sticky="ew", padx=16, pady=(0, 8))
+            
+            # Overall percentage math
+            overall_pct = ((playlist_index - 1) + (task.progress / 100.0)) / playlist_count * 100.0
+            self.playlist_progress_bar.set(overall_pct / 100.0)
+            self.playlist_progress_lbl.configure(
+                text=f"Video {playlist_index} of {playlist_count} • Overall Progress: {overall_pct:.1f}%"
+            )
+            self.status_var.set(f"Downloading... (item {playlist_index} of {playlist_count})")
+        else:
+            self.playlist_progress_lbl.grid_forget()
+            self.playlist_progress_bar.grid_forget()
+            self.status_var.set("Downloading...")
+
+        # Stats grid values
+        status_text = "Downloading..."
+        if "FFmpegMerger" in str(data.get("postprocessor", "")):
+            status_text = "Merging Video + Audio..."
+        elif "FFmpegExtractAudio" in str(data.get("postprocessor", "")):
+            status_text = "Converting Audio..."
+        
+        self.stat_status.configure(text=f"Status: {status_text}")
+        
+        speed = task.speed
+        if speed:
+            speed_mb = speed / 1024 / 1024
+            self.stat_speed.configure(text=f"Speed: {speed_mb:.1f} MB/s")
+        else:
+            self.stat_speed.configure(text="Speed: N/A")
+
+        eta = task.eta
+        if eta:
+            self.stat_eta.configure(text=f"ETA: {int(eta)}s")
+        else:
+            self.stat_eta.configure(text="ETA: N/A")
+
+        total_size_str = format_size(task.total_size)
+        downloaded_size_str = format_size(task.downloaded_size)
+        self.stat_size.configure(text=f"Size: {downloaded_size_str} / {total_size_str}")
+
+        # Re-render queue list to update active row percents
+        self._render_queue()
+
+    def _render_queue(self) -> None:
+        # Clear frame children
+        for widget in self.queue_frame.winfo_children():
+            widget.destroy()
+
+        with self.queue._lock:
+            tasks = list(self.queue.tasks)
+
+        if not tasks:
+            empty_lbl = ctk.CTkLabel(self.queue_frame, text="No items queued. Add URLs above.", font=("Segoe UI", 10), text_color="#94a3b8")
+            empty_lbl.pack(pady=10)
             return
 
-        # Complete status updates
-        self.root.after(0, lambda: self.progress_bar.set(1.0))
-        self.root.after(0, lambda: self.status_var.set(f"Status: completed {result['title']}"))
-        
-        def update_ui_on_success():
-            self.preview_image_label.grid_forget()
-            self.details_frame.grid_forget()
-            self.preview_placeholder.grid(row=0, column=0, columnspan=2, sticky="nw", padx=16, pady=16)
-            self.preview_placeholder.configure(
-                text=(
-                    f"Download Completed Successfully!\n\n"
-                    f"Title: {result['title']}\n"
-                    f"Mode: {result['mode']}\n"
-                    f"Quality: {result['quality']}\n"
-                    f"Saved to: {result['output_dir']}"
-                )
-            )
-        self.root.after(0, update_ui_on_success)
+        for idx, task in enumerate(tasks, 1):
+            row_frame = ctk.CTkFrame(self.queue_frame, fg_color="#1f2937")
+            row_frame.pack(fill="x", padx=4, pady=4)
+            
+            title_text = f"{idx}. {task.title}"
+            title_lbl = ctk.CTkLabel(row_frame, text=title_text, font=("Segoe UI", 11), text_color="#f8fafc", anchor="w", wraplength=450, justify="left")
+            title_lbl.pack(side="left", padx=8, pady=4, fill="x", expand=True)
 
-    def _update_progress(self, data: dict[str, Any]) -> None:
-        status = data.get("status")
-        
-        if status == "downloading":
-            downloaded = data.get("downloaded_bytes", 0)
-            total = data.get("total_bytes") or data.get("total_bytes_estimate") or 1
-            percent = min(100.0, (downloaded / total) * 100.0)
-            self.root.after(0, lambda: self.progress_bar.set(percent / 100.0))
+            status_colors = {
+                "Pending": "#eab308",
+                "Downloading": "#3b82f6",
+                "Completed": "#22c55e",
+                "Failed": "#ef4444",
+                "Cancelled": "#94a3b8"
+            }
+            color = status_colors.get(task.status, "#f8fafc")
             
-            speed = data.get("speed") or 0
-            eta = data.get("eta") or 0
-            
-            # Check for playlist indexing details
-            info_dict = data.get("info_dict", {})
-            playlist_index = info_dict.get("playlist_index")
-            playlist_count = info_dict.get("playlist_count")
-            
-            if playlist_index is not None and playlist_count is not None:
-                items_remaining = playlist_count - playlist_index
+            disp_status = task.status
+            if task.status == "Downloading":
+                disp_status = f"Downloading ({task.progress:.0f}%)"
                 
-                speed_mb = speed / 1024 / 1024 if speed else 0.0
-                speed_str = f" • {speed_mb:.1f} MB/s" if speed else ""
-                eta_str = f" • ETA {eta}s" if eta else ""
-                
-                status_text = (
-                    f"Status: Downloading item {playlist_index} of {playlist_count} "
-                    f"({items_remaining} remaining) • {percent:.1f}%{speed_str}{eta_str}"
+            status_lbl = ctk.CTkLabel(row_frame, text=disp_status, font=("Segoe UI", 10, "bold"), text_color=color, width=130)
+            status_lbl.pack(side="left", padx=8)
+
+            # Controls: Cancel for processing tasks, Retry/Remove for finished failures
+            if task.status in ["Downloading", "Pending"]:
+                btn_cancel = ctk.CTkButton(
+                    row_frame, 
+                    text="Cancel", 
+                    font=("Segoe UI", 9, "bold"), 
+                    fg_color="#ef4444", 
+                    hover_color="#dc2626", 
+                    text_color="#ffffff", 
+                    width=60, 
+                    height=20,
+                    command=lambda tid=task.task_id: self.queue.cancel_task(tid)
                 )
-            else:
-                speed_mb = speed / 1024 / 1024 if speed else 0.0
-                speed_str = f" • {speed_mb:.1f} MB/s" if speed else ""
-                eta_str = f" • ETA {eta}s" if eta else ""
-                status_text = f"Status: Downloading... {percent:.1f}%{speed_str}{eta_str}"
-                
-            self.root.after(0, lambda: self.status_var.set(status_text))
-            
-        elif status == "finished":
-            self.root.after(0, lambda: self.status_var.set("Status: Finished downloading, preparing files..."))
+                btn_cancel.pack(side="right", padx=8)
+            elif task.status in ["Failed", "Cancelled"]:
+                btn_retry = ctk.CTkButton(
+                    row_frame, 
+                    text="Retry", 
+                    font=("Segoe UI", 9, "bold"), 
+                    fg_color="#22c55e", 
+                    hover_color="#16a34a", 
+                    text_color="#ffffff", 
+                    width=60, 
+                    height=20,
+                    command=lambda tid=task.task_id: self.queue.retry_task(tid)
+                )
+                btn_retry.pack(side="right", padx=8)
+
+                btn_remove = ctk.CTkButton(
+                    row_frame, 
+                    text="Remove", 
+                    font=("Segoe UI", 9, "bold"), 
+                    fg_color="#374151", 
+                    hover_color="#4b5563", 
+                    text_color="#cbd5e1", 
+                    width=60, 
+                    height=20,
+                    command=lambda tid=task.task_id: self.queue.remove_task(tid)
+                )
+                btn_remove.pack(side="right", padx=(0, 4))
+
+    def _show_queue_summary(self, summary: dict[str, Any]) -> None:
+        self._set_ui_state_idle()
+        
+        # Reset labels
+        self.progress_bar.set(0.0)
+        self.video_progress_lbl.configure(text="Current Video: 0%")
+        self.playlist_progress_lbl.grid_forget()
+        self.playlist_progress_bar.grid_forget()
+        self.current_file_label.configure(text="No active download")
+        
+        self.stat_status.configure(text="Status: Finished")
+        self.stat_speed.configure(text="Speed: N/A")
+        self.stat_eta.configure(text="ETA: N/A")
+        self.stat_size.configure(text="Downloaded: N/A")
+        
+        self.status_var.set("Finished")
+
+        # Grid queue summary cards in the preview section
+        self.preview_image_label.grid_forget()
+        self.details_frame.grid_forget()
+        self.preview_placeholder.grid(row=0, column=0, columnspan=2, sticky="nw", padx=16, pady=16)
+
+        avg_speed_str = "N/A"
+        if summary.get("avg_speed"):
+            avg_speed_mb = summary["avg_speed"] / 1024 / 1024
+            avg_speed_str = f"{avg_speed_mb:.1f} MB/s"
+
+        summary_text = (
+            f"🎉 Download Summary\n\n"
+            f"• Downloaded Files: {summary['completed']} files\n"
+            f"• Failed: {summary['failed']} files\n"
+            f"• Total Transferred Size: {format_size(summary['total_size'])}\n"
+            f"• Average Speed: {avg_speed_str}\n"
+            f"• Elapsed Time: {summary['duration']:.1f}s\n"
+        )
+        self.preview_placeholder.configure(text=summary_text, justify="left")
+
+        # Open Dialog Complete window Popup
+        output_dir = self.output_dir_var.get()
+        title_summary = f"{summary['completed']} items downloaded successfully"
+        DownloadCompleteDialog(self.root, title_summary, output_dir, summary["duration"])
