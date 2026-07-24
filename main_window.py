@@ -14,6 +14,7 @@ from CTkMessagebox import CTkMessagebox
 from analyzer import analyze_url, MediaMetadata, AnalysisError
 from downloader import Downloader
 from format_manager import FormatManager, DownloadOption, format_size
+from download_manager import DownloadManager, DownloadCancelledError
 
 logger = logging.getLogger("yt_downloader_pro.main_window")
 
@@ -35,10 +36,13 @@ class MainWindow:
         
         self.downloader = Downloader()
         
-        # Mapped format options state
+        # Format detection options state
         self.metadata: MediaMetadata | None = None
         self.video_options: list[DownloadOption] = []
         self.audio_option: DownloadOption | None = None
+        
+        # Background download engine state
+        self.current_download: DownloadManager | None = None
 
         self._build_ui()
 
@@ -163,7 +167,21 @@ class MainWindow:
         self.analyze_button.pack(side="left", padx=(0, 10))
 
         self.download_button = ctk.CTkButton(action_row, text="Download", font=("Segoe UI", 11, "bold"), fg_color="#2563eb", hover_color="#1d4ed8", text_color="#ffffff", width=120, height=35, state="disabled", command=self._download_action)
-        self.download_button.pack(side="left")
+        self.download_button.pack(side="left", padx=(0, 10))
+
+        self.cancel_button = ctk.CTkButton(
+            action_row, 
+            text="Cancel", 
+            font=("Segoe UI", 11, "bold"), 
+            fg_color="#ef4444", 
+            hover_color="#dc2626", 
+            text_color="#ffffff", 
+            width=120, 
+            height=35, 
+            state="disabled", 
+            command=self._cancel_action
+        )
+        self.cancel_button.pack(side="left")
 
         # Preview Panel
         self.preview_panel = ctk.CTkFrame(self.main_card, fg_color="#1f2937", corner_radius=6)
@@ -230,6 +248,34 @@ class MainWindow:
         if folder:
             self.output_dir_var.set(folder)
 
+    def _set_ui_state_downloading(self) -> None:
+        """Locks all inputs and enables the Cancel button while downloading."""
+        self.url_entry.configure(state="disabled")
+        self.mode_combo.configure(state="disabled")
+        self.quality_combo.configure(state="disabled")
+        self.folder_button.configure(state="disabled")
+        self.analyze_button.configure(state="disabled")
+        self.download_button.configure(state="disabled")
+        self.cancel_button.configure(state="normal")
+
+    def _set_ui_state_idle(self) -> None:
+        """Restores control state when the download finishes, fails, or is cancelled."""
+        self.url_entry.configure(state="normal")
+        self.mode_combo.configure(state="normal")
+        self.folder_button.configure(state="normal")
+        self.analyze_button.configure(state="normal")
+        
+        is_analyzed = self.metadata is not None
+        if is_analyzed:
+            self.download_button.configure(state="normal")
+            if not self.metadata.is_playlist and self.download_mode_var.get() == "Video (MP4)":
+                self.quality_combo.configure(state="normal")
+        else:
+            self.download_button.configure(state="disabled")
+            self.quality_combo.configure(state="disabled")
+            
+        self.cancel_button.configure(state="disabled")
+
     def _analyze_action(self) -> None:
         url = self.url_entry.get().strip()
         if not url:
@@ -238,6 +284,8 @@ class MainWindow:
 
         self.status_var.set("Status: analyzing URL and fetching formats...")
         self.analyze_button.configure(state="disabled")
+        self.download_button.configure(state="disabled")
+        self.quality_combo.configure(state="disabled")
         
         # Start loading animation
         self.progress_bar.configure(mode="indeterminate")
@@ -293,11 +341,13 @@ class MainWindow:
         self.progress_bar.stop()
         self.progress_bar.configure(mode="determinate")
         self.progress_bar.set(0.0)
-        self.analyze_button.configure(state="normal")
         
         self.metadata = metadata
         self.video_options = video_options
         self.audio_option = audio_option
+        
+        # Restore idle UI locks based on success state
+        self._set_ui_state_idle()
 
         media_type = "playlist" if metadata.is_playlist else "video"
         self.status_var.set(f"Status: analyzed {media_type} successfully")
@@ -335,7 +385,6 @@ class MainWindow:
                 ("Total Videos:", f"{metadata.total_videos} videos"),
             ]
             self.quality_combo.configure(state="disabled")
-            self.download_button.configure(state="normal")
         else:
             details = [
                 ("Title:", metadata.title),
@@ -346,9 +395,6 @@ class MainWindow:
             ]
             
             # Setup Quality Dropdown values
-            self.download_button.configure(state="normal")
-            
-            # Trigger Mode Change logic to setup quality selectors and populate details
             self._on_mode_change(self.download_mode_var.get())
 
         # Layout metadata details
@@ -363,9 +409,11 @@ class MainWindow:
         self.progress_bar.configure(mode="determinate")
         self.progress_bar.set(0.0)
         
-        self.analyze_button.configure(state="normal")
-        self.quality_combo.configure(state="disabled")
-        self.download_button.configure(state="disabled")
+        self.metadata = None
+        self.video_options = []
+        self.audio_option = None
+        
+        self._set_ui_state_idle()
         self.status_var.set("Status: analysis failed")
 
         from analyzer import (
@@ -503,34 +551,102 @@ class MainWindow:
 
         self.progress_bar.set(0.0)
         self.status_var.set("Status: starting download...")
-        self.root.update_idletasks()
+        
+        # Lock UI controls and enable Cancel
+        self._set_ui_state_downloading()
 
-        threading.Thread(
-            target=self._run_download,
-            args=(url,),
-            daemon=True,
-        ).start()
+        # Parse selected formats to download
+        video_format_id = None
+        audio_format_id = None
+        
+        is_analyzed_video = self.metadata is not None and not self.metadata.is_playlist
+        if is_analyzed_video:
+            mode = self.download_mode_var.get()
+            if mode == "Audio (MP3)":
+                if self.audio_option and self.audio_option.audio_format:
+                    audio_format_id = self.audio_option.audio_format.format_id
+            else:
+                selected_quality = self.quality_var.get()
+                matching_opt = None
+                if self.video_options:
+                    for opt in self.video_options:
+                        if opt.quality_label == selected_quality:
+                            matching_opt = opt
+                            break
+                if matching_opt:
+                    if matching_opt.video_format:
+                        video_format_id = matching_opt.video_format.format_id
+                    if matching_opt.audio_format:
+                        audio_format_id = matching_opt.audio_format.format_id
 
-    def _run_download(self, url: str) -> None:
-        try:
-            result = self.downloader.download(
-                url=url,
-                output_dir=self.output_dir_var.get(),
-                mode=self.download_mode_var.get(),
-                quality=self.quality_var.get(),
-                progress_callback=self._update_progress,
-            )
-        except Exception as exc:
-            logger.exception("Download failed in background thread")
-            self.root.after(0, lambda: CTkMessagebox(title="Download Failed", message=f"Unable to download the media:\n{exc}", icon="cancel"))
+        # Instantiate background thread DownloadManager
+        self.current_download = DownloadManager(
+            url=url,
+            output_dir=self.output_dir_var.get(),
+            mode=self.download_mode_var.get(),
+            quality_label=self.quality_var.get(),
+            video_format_id=video_format_id,
+            audio_format_id=audio_format_id,
+            progress_callback=self._update_progress,
+            status_callback=self._update_status,
+            completion_callback=self._on_download_complete,
+        )
+        self.current_download.start()
+
+    def _cancel_action(self) -> None:
+        if self.current_download:
+            self.status_var.set("Status: cancelling download...")
+            self.current_download.cancel()
+
+    def _update_status(self, status: str) -> None:
+        self.root.after(0, lambda: self.status_var.set(f"Status: {status}"))
+
+    def _on_download_complete(self, result: dict[str, Any] | None, error: Exception | None) -> None:
+        self.root.after(0, self._set_ui_state_idle)
+        self.current_download = None
+
+        if error:
+            # Check if cancelled
+            if isinstance(error, DownloadCancelledError) or "cancelled" in str(error).lower():
+                self.root.after(0, lambda: self.status_var.set("Status: download cancelled"))
+                self.root.after(0, lambda: self.progress_bar.set(0.0))
+                return
+
+            err_msg = str(error)
+            title = "Download Failed"
+            icon = "cancel"
+
+            # Route custom errors to friendly CTkMessagebox alerts
+            if "ffmpeg" in err_msg.lower() or "ffprobe" in err_msg.lower():
+                title = "Missing FFmpeg"
+                message = "FFmpeg is missing from your system. FFmpeg is required to merge streams or transcode audio. Please install FFmpeg and add it to your PATH."
+            elif "permission" in err_msg.lower():
+                title = "Permission Denied"
+                message = "Access denied to output folder. Please select a folder with write permissions."
+            elif "space" in err_msg.lower() or "disk full" in err_msg.lower():
+                title = "Disk Full"
+                message = "The disk is full. Please clear space or select another output folder."
+            elif "copyright" in err_msg.lower():
+                title = "Copyright Restrictions"
+                message = "This video cannot be downloaded due to copyright restrictions."
+            elif "private" in err_msg.lower():
+                title = "Private Video"
+                message = "This content is private and cannot be downloaded."
+            elif "removed" in err_msg.lower() or "deleted" in err_msg.lower() or "not found" in err_msg.lower():
+                title = "Video Removed"
+                message = "This content has been removed and is unavailable."
+            else:
+                message = f"Unable to download media:\n{err_msg}"
+
+            self.root.after(0, lambda: CTkMessagebox(title=title, message=message, icon=icon))
             self.root.after(0, lambda: self.status_var.set("Status: download failed"))
             return
 
+        # Complete status updates
         self.root.after(0, lambda: self.progress_bar.set(1.0))
         self.root.after(0, lambda: self.status_var.set(f"Status: completed {result['title']}"))
         
         def update_ui_on_success():
-            # Reset layout to display completion summary
             self.preview_image_label.grid_forget()
             self.details_frame.grid_forget()
             self.preview_placeholder.grid(row=0, column=0, columnspan=2, sticky="nw", padx=16, pady=16)
@@ -546,14 +662,40 @@ class MainWindow:
         self.root.after(0, update_ui_on_success)
 
     def _update_progress(self, data: dict[str, Any]) -> None:
-        if data.get("status") == "downloading":
+        status = data.get("status")
+        
+        if status == "downloading":
             downloaded = data.get("downloaded_bytes", 0)
             total = data.get("total_bytes") or data.get("total_bytes_estimate") or 1
             percent = min(100.0, (downloaded / total) * 100.0)
             self.root.after(0, lambda: self.progress_bar.set(percent / 100.0))
+            
             speed = data.get("speed") or 0
             eta = data.get("eta") or 0
-            if speed:
-                self.root.after(0, lambda: self.status_var.set(f"Status: {percent:.1f}% • {speed/1024/1024:.1f} MB/s • ETA {eta}s"))
+            
+            # Check for playlist indexing details
+            info_dict = data.get("info_dict", {})
+            playlist_index = info_dict.get("playlist_index")
+            playlist_count = info_dict.get("playlist_count")
+            
+            if playlist_index is not None and playlist_count is not None:
+                items_remaining = playlist_count - playlist_index
+                
+                speed_mb = speed / 1024 / 1024 if speed else 0.0
+                speed_str = f" • {speed_mb:.1f} MB/s" if speed else ""
+                eta_str = f" • ETA {eta}s" if eta else ""
+                
+                status_text = (
+                    f"Status: Downloading item {playlist_index} of {playlist_count} "
+                    f"({items_remaining} remaining) • {percent:.1f}%{speed_str}{eta_str}"
+                )
             else:
-                self.root.after(0, lambda: self.status_var.set(f"Status: {percent:.1f}% complete"))
+                speed_mb = speed / 1024 / 1024 if speed else 0.0
+                speed_str = f" • {speed_mb:.1f} MB/s" if speed else ""
+                eta_str = f" • ETA {eta}s" if eta else ""
+                status_text = f"Status: Downloading... {percent:.1f}%{speed_str}{eta_str}"
+                
+            self.root.after(0, lambda: self.status_var.set(status_text))
+            
+        elif status == "finished":
+            self.root.after(0, lambda: self.status_var.set("Status: Finished downloading, preparing files..."))
