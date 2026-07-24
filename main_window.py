@@ -259,7 +259,7 @@ class MainWindow:
         self.main_card.grid(row=1, column=0, sticky="nsew", padx=24, pady=(6, 24))
         self.main_card.grid_columnconfigure(0, weight=1)
         
-        self.main_card.grid_rowconfigure(4, weight=1)  # Resizable preview panel
+        self.main_card.grid_rowconfigure(5, weight=1)  # Resizable preview panel
         self.main_card.grid_rowconfigure(7, weight=1)  # Resizable queue panel
 
         # URL Input
