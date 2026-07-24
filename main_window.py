@@ -1381,7 +1381,8 @@ class MainWindow:
 
         if metadata.is_playlist:
             # Handle playlist entries parsing
-            self.playlist_metadata, self.playlist_items = PlaylistManager.parse_flat_playlist(metadata.info_dict)
+            self.playlist_metadata = PlaylistManager.parse_playlist(metadata.info_dict)
+            self.playlist_items = self.playlist_metadata.items
             self.filtered_playlist_items = list(self.playlist_items)
             self._render_playlist_preview(metadata, thumbnail_img)
             self.playlist_scope_var.set("Selected Only")

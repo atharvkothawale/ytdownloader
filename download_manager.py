@@ -11,6 +11,8 @@ import yt_dlp
 from datetime import datetime
 
 from history_manager import HistoryManager
+from format_manager import format_size
+from analyzer import AnalysisError
 
 logger = logging.getLogger("yt_downloader_pro.download_manager")
 
